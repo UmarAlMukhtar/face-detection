@@ -1,8 +1,9 @@
 import cv2
 import time
-from face_detector import recognize_face
+import numpy as np
+from face_detector import recognize_faces
 from database import check_player, add_player
-from display_manager import show_message
+from display_manager import show_message, show_message_above_face
 
 def main():
     # Initialize the facial recognition system
@@ -16,14 +17,18 @@ def main():
     # Create window with normal resizable behavior
     cv2.namedWindow('Event Game', cv2.WINDOW_NORMAL)
     
-    # Initialize message and tracking variables
-    message = "Welcome! Please stand in front of the camera."
-    registration_start_time = None
+    # Dictionary to track registration progress for each face
+    # Format: {player_id: {'start_time': timestamp, 'complete': boolean, 'last_seen': timestamp, 
+    #                       'smooth_coords': (x, y, w, h)}}
+    registration_tracking = {}
+    
+    # Other tracking variables
     registration_duration = 10.0  # seconds required for registration
-    current_face_id = None
-    registration_complete = False
     last_recognition_time = 0
-    recognition_cooldown = 0.5  # Check more frequently than before
+    recognition_cooldown = 0.5  # seconds between recognition attempts
+    face_tracking_timeout = 2.0  # seconds to keep tracking a face that disappeared
+    display_general_message = "Welcome! Step in front of the camera to play."
+    smoothing_factor = 0.3  # Lower = smoother but more lag (0.0-1.0)
 
     while True:
         # Capture a single frame from the video feed
@@ -33,61 +38,100 @@ def main():
             break
 
         current_time = time.time()
-        registration_progress = None
+        frame_with_messages = frame.copy()  # Create a copy to draw messages on
         
-        # Only perform recognition every few seconds to avoid excessive processing
+        # Only perform recognition periodically to avoid excessive processing
         if current_time - last_recognition_time > recognition_cooldown:
             # Process the captured frame for facial recognition
-            player_id = recognize_face(frame)
+            detected_faces = recognize_faces(frame)
             last_recognition_time = current_time
-
-            # When a face is detected
-            if player_id:
-                # If this is a returning player who has already played
-                if check_player(player_id):
-                    message = "Sorry! You have already played."
-                    registration_progress = None
-                    registration_start_time = None
-                    current_face_id = None
-                else:
-                    # If this is the same face we've been tracking
-                    if current_face_id == player_id:
-                        if registration_start_time is None:
-                            # Start tracking this face
-                            registration_start_time = current_time
-                            message = "Please hold still for registration..."
-                        else:
-                            # Calculate time elapsed
-                            elapsed_time = current_time - registration_start_time
-                            # Calculate progress percentage (0.0 to 1.0)
-                            registration_progress = min(elapsed_time / registration_duration, 1.0)
-                            
-                            # Update message based on progress
-                            message = f"Registering... Please remain still"
-                            
-                            # Check if registration is complete
-                            if elapsed_time >= registration_duration and not registration_complete:
-                                add_player(player_id)
-                                message = "Registration complete! You're now ready to play!"
-                                registration_complete = True
+            
+            # Update tracking for detected faces
+            current_ids = {face['player_id'] for face in detected_faces}
+            
+            # Process each detected face
+            for face in detected_faces:
+                player_id = face['player_id']
+                current_coords = face['coordinates']
+                has_played = face['has_played']
+                
+                # Update tracking info
+                if player_id in registration_tracking:
+                    # Update last seen time
+                    tracking_info = registration_tracking[player_id]
+                    tracking_info['last_seen'] = current_time
+                    
+                    # Apply exponential smoothing to coordinates
+                    if 'smooth_coords' in tracking_info:
+                        x_old, y_old, w_old, h_old = tracking_info['smooth_coords']
+                        x_new, y_new, w_new, h_new = current_coords
+                        
+                        # Smooth the coordinates
+                        x_smooth = int(smoothing_factor * x_new + (1 - smoothing_factor) * x_old)
+                        y_smooth = int(smoothing_factor * y_new + (1 - smoothing_factor) * y_old)
+                        w_smooth = int(smoothing_factor * w_new + (1 - smoothing_factor) * w_old)
+                        h_smooth = int(smoothing_factor * h_new + (1 - smoothing_factor) * h_old)
+                        
+                        tracking_info['smooth_coords'] = (x_smooth, y_smooth, w_smooth, h_smooth)
                     else:
-                        # A different face detected, reset tracking
-                        current_face_id = player_id
-                        registration_start_time = current_time
-                        registration_complete = False
-                        message = "New face detected. Please hold still for registration..."
-            else:
-                # No face detected, reset tracking
-                message = "No face detected. Please position yourself in the frame."
-                registration_start_time = None
-                current_face_id = None
-                registration_progress = None
+                        # First time seeing this face, initialize smooth coordinates
+                        tracking_info['smooth_coords'] = current_coords
+                else:
+                    # New face, initialize tracking
+                    registration_tracking[player_id] = {
+                        'start_time': current_time,
+                        'complete': False,
+                        'last_seen': current_time,
+                        'smooth_coords': current_coords
+                    }
         
-        # Display message on frame
-        frame = show_message(message, frame, registration_progress)
+        # Clean up tracking for faces not seen for a while
+        for tracked_id in list(registration_tracking.keys()):
+            if current_time - registration_tracking[tracked_id]['last_seen'] > face_tracking_timeout:
+                registration_tracking.pop(tracked_id)
+        
+        # Display messages for all tracked faces (not just recently detected ones)
+        for player_id, tracking_info in registration_tracking.items():
+            # Skip faces that haven't been seen recently
+            if current_time - tracking_info['last_seen'] > face_tracking_timeout:
+                continue
+                
+            # Use the smoothed coordinates for display
+            coordinates = tracking_info['smooth_coords']
+            
+            # Get player status
+            has_played = check_player(player_id)
+            
+            # Create appropriate message
+            if has_played:
+                message = "Already played"
+                show_message_above_face(frame_with_messages, message, coordinates)
+            elif tracking_info['complete']:
+                message = "Ready to play!"
+                show_message_above_face(frame_with_messages, message, coordinates)
+            else:
+                # Calculate time elapsed for this face
+                elapsed_time = current_time - tracking_info['start_time']
+                # Calculate progress percentage (0.0 to 1.0)
+                registration_progress = min(elapsed_time / registration_duration, 1.0)
+                
+                if registration_progress >= 1.0:
+                    # Registration complete, mark as played
+                    add_player(player_id)
+                    tracking_info['complete'] = True
+                    message = "Ready to play!"
+                    show_message_above_face(frame_with_messages, message, coordinates)
+                else:
+                    # Still registering
+                    message = "Registering..."
+                    show_message_above_face(frame_with_messages, message, coordinates, registration_progress)
+        
+        # Show general message at bottom if no faces being tracked
+        if not registration_tracking:
+            frame_with_messages = show_message(display_general_message, frame_with_messages)
             
         # Display the resulting frame
-        cv2.imshow('Event Game', frame)
+        cv2.imshow('Event Game', frame_with_messages)
 
         # Break the loop on 'q' key press
         if cv2.waitKey(1) & 0xFF == ord('q'):

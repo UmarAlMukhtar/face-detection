@@ -11,7 +11,7 @@ def connect_db():
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS players (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        face_encoding TEXT,
+        face_features BLOB,
         played BOOLEAN DEFAULT FALSE
     )
     ''')

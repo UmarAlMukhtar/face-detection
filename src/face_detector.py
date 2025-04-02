@@ -57,19 +57,23 @@ def initialize_db():
 
 def extract_face_features(face_img):
     """Extract face features using OpenCV"""
-    # Resize to a standard size
-    resized = cv2.resize(face_img, (100, 100))
-    # Convert to grayscale
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    # Apply histogram equalization for better feature extraction
-    equalized = cv2.equalizeHist(gray)
-    # Flatten the image into a feature vector
-    features = equalized.flatten()
-    # Return normalized features
-    return features / 255.0
+    try:
+        # Resize to a standard size
+        resized = cv2.resize(face_img, (100, 100))
+        # Convert to grayscale
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        # Apply histogram equalization for better feature extraction
+        equalized = cv2.equalizeHist(gray)
+        # Flatten the image into a feature vector
+        features = equalized.flatten()
+        # Return normalized features
+        return features / 255.0
+    except Exception as e:
+        print(f"Error extracting features: {e}")
+        return None
 
-def recognize_face(frame):
-    """Process a video frame and recognize faces using OpenCV"""
+def recognize_faces(frame):
+    """Process a video frame and recognize multiple faces using OpenCV"""
     # Initialize database if needed
     initialize_db()
     
@@ -85,51 +89,69 @@ def recognize_face(frame):
     )
     
     if len(faces) == 0:
-        return None  # No face detected
+        return []  # No faces detected
     
     # Connect to the database
     conn = sqlite3.connect('data/players_database.db')
     cursor = conn.cursor()
     
-    # Process each detected face (just use the first one for simplicity)
-    x, y, w, h = faces[0]  # Take the first face detected
+    # List to store face info: (player_id, face_coordinates, has_played)
+    detected_faces = []
     
-    # Draw rectangle around the face
-    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-    
-    # Extract face region
-    face_img = frame[y:y+h, x:x+w]
-    
-    # Extract features
-    features = extract_face_features(face_img)
-    
-    # Check if this face exists in the database
-    cursor.execute("SELECT id, face_features FROM players")
-    best_match_id = None
-    best_match_score = float('inf')  # Lower is better
-    
-    for row in cursor.fetchall():
-        player_id, stored_features_blob = row
-        if stored_features_blob:
-            stored_features = pickle.loads(stored_features_blob)
+    # Process each detected face
+    for (x, y, w, h) in faces:
+        # Draw rectangle around the face
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        
+        # Extract face region
+        face_img = frame[y:y+h, x:x+w]
+        
+        # Extract features
+        features = extract_face_features(face_img)
+        if features is None:
+            continue
             
-            # Compare using Euclidean distance
-            distance = np.linalg.norm(features - stored_features)
+        # Check if this face exists in the database
+        cursor.execute("SELECT id, face_features, played FROM players")
+        best_match_id = None
+        best_match_score = float('inf')  # Lower is better
+        has_played = False
+        
+        for row in cursor.fetchall():
+            player_id, stored_features_blob, played = row
+            if stored_features_blob:
+                stored_features = pickle.loads(stored_features_blob)
+                
+                # Compare using Euclidean distance
+                distance = np.linalg.norm(features - stored_features)
+                
+                # If distance is small enough, consider it a match
+                if distance < 40 and distance < best_match_score:  # Threshold value
+                    best_match_id = player_id
+                    best_match_score = distance
+                    has_played = bool(played)
+        
+        if best_match_id:
+            # Add to detected faces list
+            face_info = {
+                'player_id': best_match_id,
+                'coordinates': (x, y, w, h),
+                'has_played': has_played
+            }
+            detected_faces.append(face_info)
+        else:
+            # If no match, add new face to database but don't mark as played yet
+            features_blob = pickle.dumps(features)
+            cursor.execute("INSERT INTO players (face_features, played) VALUES (?, FALSE)", (features_blob,))
+            player_id = cursor.lastrowid
+            conn.commit()
             
-            # If distance is small enough, consider it a match
-            if distance < 40 and distance < best_match_score:  # Threshold value
-                best_match_id = player_id
-                best_match_score = distance
+            face_info = {
+                'player_id': player_id,
+                'coordinates': (x, y, w, h),
+                'has_played': False
+            }
+            detected_faces.append(face_info)
     
-    if best_match_id:
-        conn.close()
-        return best_match_id
-    
-    # If no match, add new face to database but don't mark as played yet
-    features_blob = pickle.dumps(features)
-    cursor.execute("INSERT INTO players (face_features, played) VALUES (?, FALSE)", (features_blob,))
-    player_id = cursor.lastrowid
-    conn.commit()
     conn.close()
-    
-    return player_id
+    return detected_faces
